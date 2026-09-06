@@ -33,13 +33,7 @@ jobs:
       run: |
         BUILD_TOOLS_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
         BT=/usr/local/lib/android/sdk/build-tools/$BUILD_TOOLS_VERSION
-        KEYSTORE=$HOME/.android/debug.keystore
-        if [ ! -f "$KEYSTORE" ]; then
-          mkdir -p $HOME/.android
-          keytool -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
-            -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" \
-            -keyalg RSA -keysize 2048 -validity 10000
-        fi
+        KEYSTORE=$GITHUB_WORKSPACE/ci-debug.keystore
         ZIPALIGNED=$HOME/app-release-unsigned-aligned.apk
         $BT/zipalign -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$ZIPALIGNED"
         $BT/apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
