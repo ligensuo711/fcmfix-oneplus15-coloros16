@@ -209,8 +209,11 @@ public class BroadcastFix extends XposedModule {
                     return;
                 }
                 Intent intent = (Intent) methodHookParam.args[finalIntent_args_index];
-                // 介入条件：Intent未包含唤醒停止的pkg 且 Intent是FCM
-                if((intent.getFlags() & Intent.FLAG_INCLUDE_STOPPED_PACKAGES) == 0 && isFCMIntent(intent)){
+                // 介入条件：Intent是FCM且目标在允许列表。注意不能以
+                // FLAG_INCLUDE_STOPPED_PACKAGES 是否缺失作为介入条件：
+                // 部分 ROM 上 GMS 原生携带该 flag（GCM 日志 xflg=0x4），
+                // 此时跳过会导致投递窗口（防二次冻结/断网）完全不生效。
+                if(isFCMIntent(intent)){
                     String target;
                     if (intent.getComponent() != null) {
                         target = intent.getComponent().getPackageName();
