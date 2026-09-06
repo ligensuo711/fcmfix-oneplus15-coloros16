@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
-    
+
     - name: set up JDK 21
       uses: actions/setup-java@v4
       with:
@@ -22,56 +22,51 @@ jobs:
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
-      
+
     - name: Retrieve version name
       run: echo VERSION_NAME=$(grep "versionName" app/build.gradle | sed -E 's/.*versionName "([^"]+)".*/\1/') >> $GITHUB_ENV
 
-    - name: Retrieve version code
-      run: echo VERSION_CODE=$(cat ${{ github.workspace }}/app/build.gradle | grep "versionCode" | grep -Eo "[0-9]+") >> $GITHUB_ENV
-
     - name: Build with Gradle
-      run: ./gradlew assembleRelease
+      run: ./gradlew assembleRelease --no-daemon
 
-    - name: Setup build tool version variable
-      shell: bash
+    - name: Sign APK (debug keystore)
       run: |
-        BUILD_TOOL_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
-        echo "BUILD_TOOL_VERSION=$BUILD_TOOL_VERSION" >> $GITHUB_ENV
-        echo Last build tool version is: $BUILD_TOOL_VERSION
+        BUILD_TOOLS_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
+        BT=/usr/local/lib/android/sdk/build-tools/$BUILD_TOOLS_VERSION
+        KEYSTORE=$HOME/.android/debug.keystore
+        if [ ! -f "$KEYSTORE" ]; then
+          mkdir -p $HOME/.android
+          keytool -genkeypair -keystore "$KEYSTORE" -storepass android -keypass android \
+            -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA -keysize 2048 -validity 10000
+        fi
+        ZIPALIGNED=$HOME/app-release-unsigned-aligned.apk
+        $BT/zipalign -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$ZIPALIGNED"
+        $BT/apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+          --out app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk "$ZIPALIGNED"
+        $BT/apksigner verify --print-certs app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk || true
 
-    - name: Sign APK
-      uses: r0adkll/sign-android-release@v1
-      with:
-        releaseDirectory: ${{ github.workspace }}/app/build/outputs/apk/release
-        signingKeyBase64: ${{ secrets.SIGNINGKEYBASE64 }}
-        alias: ${{ secrets.ALIAS }}
-        keyStorePassword: ${{ secrets.KEYSTOREPASSWORD }}
-        keyPassword: ${{ secrets.KEYPASSWORD }}
-      env:
-        BUILD_TOOLS_VERSION: ${{ env.BUILD_TOOL_VERSION }}
-
-    - name: Rename APK
-      run: mv ${{ github.workspace }}/app/build/outputs/apk/release/app-release-unsigned-signed.apk ${{ github.workspace }}/app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk
-    
     - name: Upload built apk
       uses: actions/upload-artifact@v4
       with:
         name: release
-        path: ${{ github.workspace }}/app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk
+        path: app/build/outputs/apk/release/*.apk
 
     - name: Release
       uses: softprops/action-gh-release@v2
       with:
-        name: "FCMFix ColorOS (${{ env.VERSION_NAME }})"
+        name: "FCMFix ColorOS PHK110 (${{ env.VERSION_NAME }})"
         tag_name: ${{ env.VERSION_NAME }}
         token: "${{ github.token }}"
         body: |
-          本版本由仓库 CI 使用专用发布证书构建并签名。
+          PHK110 (一加 Ace 2 / ColorOS 16 V16.0.0) 适配构建，基于上游 53-coloros-8。
 
-          本版本将最终安装包名更新为 io.github.artifical0.fcmfix.coloros，以符合 LSPosed 官方仓库的包名归属验证要求。
+          变更：补齐 PHK110 固件上的 stopped 应用 FCM 拉起链路 hook：
+          - OplusAppStartupManager.shouldPreventStartProcess（FCM 投递窗口内放行）
+          - BroadcastQueueModernImplExtImpl.skipScheduleReceiver*Locked（允许列表 FCM 强制不跳过）
+          - OplusSceneManager.checkReceiverIfRestricted（允许列表 FCM 放行）
+          - OplusHansManager.isAllowStartService（允许列表放行）
 
-          由于包名已更改，不能直接覆盖旧版；请先在 LSPosed 中停用并卸载旧版，安装后重新勾选作用域和允许推送的应用。
-
-          详细变更、适用范围和安装方法见 README。
+          注意：本构建使用 CI 生成的临时调试密钥签名，与上游 Release 签名不同；请先卸载旧版再安装。仅用于 PHK110 固件，PLK110 用户请用上游官方包。
         files: |
-          ${{ github.workspace }}/app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk
+          app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk

@@ -264,6 +264,11 @@ public class OplusProxyFix extends XposedModule {
         return false;
     }
 
+    /** Cross-hook accessor: true while the uid is inside an active FCM delivery window. */
+    public static boolean isInFcmWindow(int uid) {
+        return isInFcmDeliveryWindow(uid);
+    }
+
     private static String getFcmDeliveryPackage(int uid) {
         String packageName = sFcmDeliveryPackages.get(uid);
         return packageName == null ? "uid:" + uid : packageName;
