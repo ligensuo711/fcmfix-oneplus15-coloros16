@@ -33,7 +33,7 @@ public class OplusProxyFix extends XposedModule {
             "com.android.server.hans.freeze.HansCGroup";
     private static final String TYPE_BIND_SERVICE_FROM_GCM = "bsgcm";
     private static final String START_PROCESS_FROM_GCM_BIND_SERVICE = "system[gcm]";
-    private static final long FCM_DELIVERY_WINDOW_MS = 20_000L;
+    private static final long FCM_DELIVERY_WINDOW_MS = 60_000L;
 
     /**
      * ColorOS can unfreeze an FCM target, deliver the broadcast and freeze it again about
