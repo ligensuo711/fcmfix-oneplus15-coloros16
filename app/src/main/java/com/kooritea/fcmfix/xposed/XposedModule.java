@@ -9,10 +9,18 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.IntentFilter;
 import android.content.SharedPreferences;
+import android.content.pm.PackageManager;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Process;
+import android.os.SystemClock;
 import android.os.UserManager;
 import android.util.Log;
+import com.kooritea.fcmfix.util.FcmTrust;
+import com.kooritea.fcmfix.util.ConfigSnapshot;
+import com.kooritea.fcmfix.util.DiagnosticLogger;
+import com.kooritea.fcmfix.util.OplusAttribution;
+import java.lang.reflect.Method;
 
 import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
@@ -35,16 +43,25 @@ public abstract class XposedModule {
     private static String selfPackageName = "UNKNOWN";
 
     protected final ClassLoader classLoader;
-    public static Set<String> allowList = null;
     static final String TAG = "FcmFix";
-    private static final HashMap<String, Object> config = new HashMap<>();
+    private static volatile ConfigSnapshot config;
+    private static boolean reloadRequested;
 
     @SuppressLint("StaticFieldLeak")
-    protected static Context context = null;
+    protected static volatile Context context = null;
     private static final ArrayList<XposedModule> instances = new ArrayList<>();
     private static Boolean isInitReceiver = false;
-    public static Boolean isBootComplete = false;
+    public static volatile boolean isBootComplete = false;
     private static Thread loadConfigThread = null;
+    private static final Set<String> loggedWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    private static final DiagnosticLogger diagnosticLogger = new DiagnosticLogger(
+            text -> XposedBridge.log("[fcmfix] " + text),
+            error -> Log.w(TAG, "Diagnostic logging/relay failed; further relay warnings suppressed", error));
+
+    protected static void logOnce(String message) {
+        // Bounded deduplication so third-party spam cannot grow system_server memory indefinitely.
+        if (loggedWarnings.size() < 64 && loggedWarnings.add(message)) printLog(message);
+    }
 
     protected XposedModule(final ClassLoader classLoader) {
         this.classLoader = classLoader;
@@ -113,19 +130,32 @@ public abstract class XposedModule {
         printLog(text, false);
     }
 
-    protected static void printLog(String text, Boolean isDiagnosticsLog) {
-        Log.d(TAG, text);
-        if (isDiagnosticsLog) {
-            Intent log = new Intent(ACTION_LOG);
-            log.putExtra("text", "[" + getSelfPackageName() + "]" + text);
+    protected static void printLog(String text, boolean isDiagnosticsLog) {
+        Context logContext = context;
+        diagnosticLogger.log("[" + getSelfPackageName() + "]" + text, isDiagnosticsLog,
+                SystemClock.elapsedRealtime(), logContext == null ? null
+                        : message -> sendDiagnosticLog(logContext, message));
+    }
 
-            try {
-                context.sendBroadcast(log);
-            } catch (Throwable e) {
-                XposedBridge.log("[fcmfix] [" + getSelfPackageName() + "]" + text);
-            }
+    // Lint reads the module APK manifest, but this bridge runs inside the host process.
+    // The signature permission is checked against that host at runtime below; do not
+    // request it for the module APK or suppress permission checking anywhere else.
+    @SuppressLint("MissingPermission")
+    private static void sendDiagnosticLog(Context logContext, String message) {
+        Intent log = new Intent(ACTION_LOG);
+        log.setPackage("com.google.android.gms");
+        log.putExtra("text", message);
+        // Our own worker has no incoming GMS Binder identity.
+        if (logContext.checkSelfPermission("android.permission.INTERACT_ACROSS_USERS")
+                == PackageManager.PERMISSION_GRANTED) {
+            logContext.sendBroadcastAsUser(log, Process.myUserHandle());
+        } else if (Process.myUid() != Process.SYSTEM_UID) {
+            // An ordinary app context already belongs to its own user. The qualified-user
+            // warning is specific to system UID; preserve the ordinary-app relay path.
+            logContext.sendBroadcast(log);
         } else {
-            XposedBridge.log("[fcmfix] [" + getSelfPackageName() + "]" + text);
+            // The logger catches this and retains local output without a noisy fallback.
+            throw new SecurityException("Host cannot send a user-qualified diagnostic broadcast");
         }
     }
 
@@ -153,56 +183,45 @@ public abstract class XposedModule {
     };
 
     protected boolean targetIsAllow(String packageName) {
-        if (config.get("init") == null) {
-            this.checkUserDeviceUnlockAndUpdateConfig();
+        ConfigSnapshot snapshot = config;
+        if (snapshot == null) {
+            checkUserDeviceUnlockAndUpdateConfig();
+            return false;
         }
-        if (MODULE_PACKAGE_NAME.equals(packageName)) {
-            return true;
-        }
-        if (allowList != null) {
-            return allowList.contains(packageName);
-        }
-        return false;
+        return packageName != null && snapshot.allowList.contains(packageName);
     }
 
     protected boolean getBooleanConfig(String key, boolean defaultValue) {
-        if (config.get("init") == null) {
-            this.checkUserDeviceUnlockAndUpdateConfig();
-        }
-        if (config.get("init") == null) {
+        ConfigSnapshot snapshot = config;
+        if (snapshot == null) {
+            checkUserDeviceUnlockAndUpdateConfig();
             return defaultValue;
         }
-        Object value = config.get(key);
-        return value == null ? defaultValue : (Boolean) value;
+        return snapshot.options.getOrDefault(key, defaultValue);
     }
 
-    protected static void onUpdateConfig() {
-        if (loadConfigThread == null) {
-            loadConfigThread = new Thread() {
-                @Override
-                public void run() {
-                    super.run();
-                    try {
-                        SharedPreferences remotePreferences = XposedBridge.getRemotePreferences("config");
-                        if (remotePreferences == null) {
-                            throw new IllegalStateException("remotePreferences 不可用");
-                        }
-                        allowList = remotePreferences.getStringSet("allowList", allowList == null ? new HashSet<>() : allowList);
-                        if (allowList != null && "android".equals(getSelfPackageName())) {
-                            printLog("[Modern Xposed API]onUpdateConfig allowList size: " + allowList.size());
-                        }
-                        config.put("disableAutoCleanNotification", remotePreferences.getBoolean("disableAutoCleanNotification", false));
-                        config.put("includeIceBoxDisableApp", remotePreferences.getBoolean("includeIceBoxDisableApp", false));
-                        config.put("noResponseNotification", remotePreferences.getBoolean("noResponseNotification", false));
-                        config.put("init", true);
-                    } catch (Throwable e) {
-                        printLog("通过现代Xposed API读取配置失败: " + e.getMessage());
+    protected static synchronized void onUpdateConfig() {
+        reloadRequested = true;
+        if (loadConfigThread != null) return;
+        loadConfigThread = new Thread(() -> {
+            while (true) {
+                synchronized (XposedModule.class) {
+                    if (!reloadRequested) {
+                        loadConfigThread = null;
+                        return;
                     }
-                    loadConfigThread = null;
+                    reloadRequested = false;
                 }
-            };
-            loadConfigThread.start();
-        }
+                try {
+                    SharedPreferences preferences = XposedBridge.getRemotePreferences("config");
+                    if (preferences == null) throw new IllegalStateException("RemotePreferences unavailable");
+                    config = new ConfigSnapshot(preferences.getAll());
+                } catch (Throwable e) {
+                    printLog("Remote config reload failed: " + e.getMessage());
+                }
+            }
+        }, "FCMFix-config");
+        loadConfigThread.start();
     }
 
     private static void onUninstallFcmfix() {
@@ -224,20 +243,13 @@ public abstract class XposedModule {
                 context.registerReceiver(new BroadcastReceiver() {
                     public void onReceive(Context context, Intent intent) {
                         String action = intent.getAction();
-                        if (ACTION_UPDATE_CONFIG.equals(action)) {
+                        if (ACTION_UPDATE_CONFIG.equals(action) && isConfigSender(this)) {
                             onUpdateConfig();
                         }
                     }
                 }, updateConfigIntentFilter, Context.RECEIVER_EXPORTED);
             } else {
-                context.registerReceiver(new BroadcastReceiver() {
-                    public void onReceive(Context context, Intent intent) {
-                        String action = intent.getAction();
-                        if (ACTION_UPDATE_CONFIG.equals(action)) {
-                            onUpdateConfig();
-                        }
-                    }
-                }, updateConfigIntentFilter);
+                logOnce("Authenticated config refresh requires Android 14+; reboot to reload on older Android.");
             }
 
             IntentFilter unInstallIntentFilter = new IntentFilter();
@@ -296,9 +308,91 @@ public abstract class XposedModule {
     }
 
     protected boolean isFCMAction(String action) {
-        return action != null && (action.endsWith(".android.c2dm.intent.RECEIVE") ||
-                "com.google.firebase.MESSAGING_EVENT".equals(action) ||
-                "com.google.firebase.INSTANCE_ID_EVENT".equals(action));
+        return com.kooritea.fcmfix.util.FcmTrust.isAction(action);
+    }
+
+    private static boolean isConfigSender(BroadcastReceiver receiver) {
+        if (Build.VERSION.SDK_INT < 34 || context == null) return false;
+        try {
+            return MODULE_PACKAGE_NAME.equals(receiver.getSentFromPackage())
+                    && receiver.getSentFromUid() == context.getPackageManager().getPackageUid(MODULE_PACKAGE_NAME, 0);
+        } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+            return false;
+        }
+    }
+
+    protected static boolean isGmsUid(int uid) {
+        if (context == null || uid < 10000) return false;
+        // Existing unfreeze/UID resolution uses this process's user. Do not apply its
+        // window to the personal-profile copy of a work-profile broadcast target.
+        if (!android.os.UserHandle.getUserHandleForUid(uid).equals(android.os.Process.myUserHandle())) return false;
+        try {
+            String[] packages = context.getPackageManager().getPackagesForUid(uid);
+            return com.kooritea.fcmfix.util.FcmTrust.isGmsSender(uid, packages);
+        } catch (RuntimeException e) {
+            printLog("Cannot verify GMS UID: " + e.getMessage());
+        }
+        return false;
+    }
+
+    protected static String explicitTarget(Intent intent) {
+        if (intent == null) return null;
+        return FcmTrust.target(intent.getPackage(), intent.getComponent() == null
+                ? null : intent.getComponent().getPackageName());
+    }
+
+    protected static int attributionIndex(Method method) {
+        String[] types = java.util.Arrays.stream(method.getParameterTypes()).map(Class::getName).toArray(String[]::new);
+        return OplusAttribution.callerIndex(method.getDeclaringClass().getName(),
+                method.getName(), method.getReturnType().getName(), types);
+    }
+
+    protected boolean trustedDelivery(Intent intent, String target, XC_MethodHook.MethodHookParam param) {
+        // Require a coherent, explicit destination. Do not select an arbitrary allowlisted string argument.
+        if (!isBootComplete || intent == null || target == null || !target.equals(explicitTarget(intent))
+                || !targetIsAllow(target)) return false;
+        try {
+            // A queued broadcast is attributed by BroadcastRecord, never by ambient Binder identity.
+            for (Object arg : param.args) {
+                if (arg == null || !"com.android.server.am.BroadcastRecord".equals(arg.getClass().getName())) continue;
+                return XposedHelpers.getObjectField(arg, "intent") == intent
+                        && FcmTrust.RECEIVE.equals(intent.getAction())
+                        && isGmsUid((Integer) XposedHelpers.getObjectField(arg, "callingUid"));
+            }
+            if (param.method instanceof Method) {
+                Method method = (Method) param.method;
+                int index = attributionIndex(method);
+                if (index >= 0) {
+                    int callerUid = (Integer) param.args[index];
+                    String methodName = method.getName();
+                    // Validate the actual callee too, not only the Intent destination.
+                    if ("isAppClassifyRestricted".equals(methodName)) {
+                        if (!target.equals(param.args[1])) return false;
+                    } else {
+                        int serviceIndex = "isAllowStartFromBindService".equals(methodName) ? 3 : 4;
+                        Object info = XposedHelpers.getObjectField(param.args[serviceIndex], "appInfo");
+                        if (!(info instanceof android.content.pm.ApplicationInfo)
+                                || !target.equals(((android.content.pm.ApplicationInfo) info).packageName)) return false;
+                    }
+                    boolean gms = isGmsUid(callerUid);
+                    String[] packages = context.getPackageManager().getPackagesForUid(callerUid);
+                    boolean selfInWindow = packages != null && java.util.Arrays.asList(packages).contains(target)
+                            && OplusProxyFix.isInFcmDeliveryWindow(callerUid);
+                    boolean gcmBind = "isAllowStartFromBindService".equals(methodName)
+                            && "bsgcm".equals(param.args[5]);
+                    boolean trusted = FcmTrust.allowsService(intent.getAction(), gms, selfInWindow, gcmBind);
+                    if (trusted && gms) OplusProxyFix.beginFcmDeliveryWindow(target);
+                    if (!trusted) logOnce("FCM rejected: untrusted service sender uid=" + callerUid
+                            + ", target=" + target + ", method=" + methodName);
+                    return trusted;
+                }
+            }
+            // Only the synchronous broadcast path may inherit the verified entry context.
+            return FcmTrust.matches(intent.getAction(), target);
+        } catch (Throwable error) {
+            logOnce("Unsupported delivery attribution: " + param.method + ": " + error);
+            return false;
+        }
     }
 
     protected boolean isFCMIntent(Intent intent) {

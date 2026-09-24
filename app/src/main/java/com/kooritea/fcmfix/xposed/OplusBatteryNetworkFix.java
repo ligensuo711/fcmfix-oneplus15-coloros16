@@ -10,8 +10,9 @@ import java.lang.reflect.Method;
 
 /**
  * ColorOS Battery's GoogleRestrictionController applies POLICY_REJECT_ALL when its
- * Google connectivity probe fails. Keep the hook inside com.oplus.battery so manual
- * per-app network controls from Settings/TrafficMonitor remain untouched.
+ * Google connectivity probe fails. This intercepts every matching Google UID reject-all
+ * write inside com.oplus.battery, not exclusively that controller's call site.
+ * Calls made directly by Settings/TrafficMonitor are outside this hook's process.
  */
 public class OplusBatteryNetworkFix extends XposedModule {
 

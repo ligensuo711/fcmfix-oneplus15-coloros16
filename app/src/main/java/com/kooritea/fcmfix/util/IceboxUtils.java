@@ -17,6 +17,19 @@ import androidx.core.content.ContextCompat;
 import java.util.Objects;
 
 public class IceboxUtils extends BroadcastReceiver {
+    private static final java.util.concurrent.ThreadPoolExecutor ACTIVATOR =
+            new java.util.concurrent.ThreadPoolExecutor(1, 1, 30,
+                    java.util.concurrent.TimeUnit.SECONDS,
+                    new java.util.concurrent.ArrayBlockingQueue<>(8),
+                    new java.util.concurrent.ThreadPoolExecutor.AbortPolicy());
+
+    public static void requestActivation(Context context, String target) {
+        try {
+            ACTIVATOR.execute(() -> activeApp(context, target));
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            Log.w(TAG, "IceBox activation queue full: " + target);
+        }
+    }
     public final static int REQUEST_CODE = 0x2333;
     public final static String PACKAGE_NAME = "com.catchingnow.icebox";
     public final static String SDK_PERMISSION = PACKAGE_NAME + ".SDK";

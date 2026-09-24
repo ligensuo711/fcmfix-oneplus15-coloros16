@@ -8,6 +8,14 @@ public abstract class XC_MethodHook {
         public Member method;
         public Object thisObject;
         public Object[] args;
+        public Runnable finallyAction;
+
+        public void addFinallyAction(Runnable action) {
+            Runnable previous = finallyAction;
+            finallyAction = () -> {
+                try { action.run(); } finally { if (previous != null) previous.run(); }
+            };
+        }
 
         private Object result;
         private Throwable throwable;

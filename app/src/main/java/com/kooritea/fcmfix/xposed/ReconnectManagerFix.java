@@ -279,7 +279,7 @@ public class ReconnectManagerFix extends XposedModule {
                                         }
                                     }
                                 }
-                                printLog("自动寻找hook点失败: 未找到目标方法", true);
+                                printLog("自动寻找hook点失败: 未找到目标方法");
                             }
                         }
                     });
@@ -288,7 +288,7 @@ public class ReconnectManagerFix extends XposedModule {
             }
         }catch (Throwable e){
             editor.putBoolean("enable", false);
-            printLog("自动寻找hook点失败"+e.getMessage(), true);
+            printLog("自动寻找hook点失败"+e.getMessage());
             this.sendNotification("自动更新配置文件失败", "未能找到hook点，已禁用重连修复和固定心跳功能。");
             e.printStackTrace();
         }

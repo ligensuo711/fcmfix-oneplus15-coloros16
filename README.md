@@ -7,6 +7,9 @@ ColorOS 16 阻止 Google FCM 唤醒后台、无进程或已停止应用的问题
 FCM。它的作用是在 Google Play 服务已经收到消息后，修复消息从 GMS 传递到目标应用
 时被 ColorOS 拦截的问题。
 
+> 当前候选版为 [53-coloros-9-rc1](https://github.com/Artifical0/fcmfix-oneplus15-coloros16/releases/tag/53-coloros-9-rc1)，包含安全加固与日志优化。下方历史实机结果属于此前已发布版本，不代表本轮修改已经
+> 通过真机回归；本轮验证状态、行为变化和测试清单见 [发布加固记录](docs/release-hardening.md)。
+
 ## 它解决的是什么问题
 
 正常的 FCM 推送链路如下：
@@ -38,7 +41,8 @@ FCM。它的作用是在 Google Play 服务已经收到消息后，修复消息�
 
 ### 系统框架作用域
 
-- 为目标应用的 FCM 广播补充 `FLAG_INCLUDE_STOPPED_PACKAGES`，允许广播到达已停止应用；
+- 核验 GMS 真实 UID、精确的 FCM action 和明确目标后，为允许列表应用补充
+  `FLAG_INCLUDE_STOPPED_PACKAGES`，允许广播到达已停止应用；
 - 动态适配 Android 16 的广播方法参数，避免 ColorOS 复制 Intent 后丢失放行标记；
 - 仅对模块允许列表中的目标应用绕过 ColorOS 应用分类、FCM 自启动、GCM bind 和
   service 启动限制；
@@ -54,9 +58,10 @@ ColorOS 的 `com.oplus.battery` 会在 Google 连通性探测失败时调用系�
 给 GMS、Play 商店或 ConfigUpdater 写入 `POLICY_REJECT_ALL`，即同时禁止 Wi-Fi 和
 移动数据。
 
-本模块只在“电池”进程中拦截这项针对 Google 核心包的自动限制，并改为
-`POLICY_NONE`。从系统设置中由用户手动配置的应用联网规则不在这个进程中，因此不会
-被模块强行覆盖。
+本模块拦截的是 `com.oplus.battery` 进程内针对指定 Google 核心 UID 的所有
+`POLICY_REJECT_ALL` 写入，并改为 `POLICY_NONE`，不是仅 Hook 某一个 controller。
+不直接修改“设置/流量管理”进程中的规则；但如果某个 OTA 将手动设置也转交电池进程
+通过同一接口写入，该写入也可能被影响，需针对对应固件复查。
 
 ## 它不能解决什么
 
@@ -71,7 +76,7 @@ ColorOS 的 `com.oplus.battery` 会在 Google 连通性探测失败时调用系�
 
 ## 适用环境
 
-已完成实机验证的环境：
+历史发布版本已完成实机验证的环境（本轮加固需重新回归）：
 
 - 设备：一加 15 国行版（PLK110）；
 - 系统：ColorOS `16.0.10.500`，Android 16；
@@ -94,11 +99,15 @@ ColorOS 的 `com.oplus.battery` 会在 Google 连通性探测失败时调用系�
 7. 确保目标应用本身的通知权限和通知频道已启用。
 
 允许列表用于限制放行范围。不要无条件全选所有应用；只选择确实使用 FCM 且需要后台
-推送的应用即可。修改允许列表通常会即时更新，异常时重启一次手机。
+推送的应用即可。Android 14 及以上通过带发送方身份的配置广播即时刷新；更早的 Android
+保存配置后需重启手机。当前不承诺工作资料、应用分身或多用户推送支持。
+
+注意：加入允许列表也意味着允许可信 FCM 唤醒被用户主动“强行停止”的应用。
+系统杀进程、冻结与“强行停止”不是同一概念；当前版本没有单独的强停唤醒开关。
 
 目标应用不需要为了本模块额外挂入系统“流量管理”白名单。模块只在一次 FCM 投递后的
-短窗口内处理 ColorOS 自动触发的后台断网，不会永久放开应用后台联网；用户主动设置的
-Wi-Fi、移动数据权限仍按系统设置执行。
+短窗口内处理 ColorOS 后台断网，不会永久放开目标应用后台联网。Google 核心包另有
+上文所述的电池进程策略 Hook，不能将这两项机制混为一谈。
 
 当前版本使用 LSPosed 官方仓库可验证包名 `io.github.artifical0.fcmfix.coloros`。
 包名变更后不能直接覆盖 `com.fcmfix.coloros` 或 `com.kooritea.fcmfix.op15` 旧版；
@@ -132,13 +141,15 @@ Wi-Fi、移动数据权限仍按系统设置执行。
 5. system_server 启动 Nekogram 的 `FirebaseInstanceIdReceiver`；
 6. Nekogram 变为 `stopped=false`，并在约 0.57 秒后生成通知。
 
-这证明当前版本不仅能处理普通划卡或后台进程被清理，也能在本机上恢复 Android
+这证明当时测试的发布版本不仅能处理普通划卡或后台进程被清理，也能在本机上恢复 Android
 package stopped 状态下的 FCM 投递。
 
 ## 应用内选项
 
 - **阻止应用停止时自动清除通知**：保留目标应用已有的通知；
-- **允许唤醒被冰箱冻结的应用**：与 Ice Box 等冻结工具配合使用；
+- **允许唤醒被冰箱冻结的应用**：尝试通过 Ice Box SDK 异步激活（默认关闭）。不阻塞或
+  重放系统广播；如果本次广播解析时应用仍被禁用，本条消息可能无法送达，需要后续消息
+  或应用主动同步。SDK 缺失、无权限或队列满时保留系统原行为；
 - **全选包含 FCM 的应用**：根据应用组件扫描结果批量加入，建议之后手动检查；
 - **打开 FCM Diagnostics**：打开 GMS 自带诊断页面，检查 FCM 连接状态。
 
@@ -157,8 +168,9 @@ package stopped 状态下的 FCM 投递。
 
 如果日志已经显示 `Successful broadcast`，应用进程也被拉起，但通知仍延迟，检查新版
 日志中是否出现 `Oplus FCM delivery window`、`Oplus FCM Hans-freeze bypass` 或
-`Oplus FCM socket-close bypass`。这属于 ColorOS 在广播投递后的二次冻结/断网问题，
-不是 GMS 长连接断开。
+`Oplus FCM socket-close bypass`。ColorOS 在广播投递后的二次冻结/断网是延迟的可能
+原因之一；仅凭“广播成功、进程已启动”不能排除应用内部同步、消息优先级、网络
+等其他延迟原因，需要结合时间戳和日志判断。
 
 刚重启后 GMS 重新建立连接可能需要一点时间，测试时应先确认 FCM Diagnostics 已连接。
 

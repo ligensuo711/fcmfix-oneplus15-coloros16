@@ -193,7 +193,7 @@ public class AutoStartFix extends XposedModule {
                         if (target == null) {
                             target = findAllowedPackageArgument(methodHookParam.args);
                         }
-                        if (target != null && targetIsAllow(target)) {
+                        if (trustedDelivery(intent, target, methodHookParam)) {
                             printLog("Oplus auto-start bypass: pkg=" + target
                                     + ", method=" + method.getName(), true);
                             methodHookParam.setResult(false);

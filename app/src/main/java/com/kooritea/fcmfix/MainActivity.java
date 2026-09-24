@@ -184,14 +184,20 @@ public class MainActivity extends AppCompatActivity {
                 AppInfo appInfo = new AppInfo(packageInfo);
                 if (packageInfo.receivers != null) {
                     for (ActivityInfo  receiverInfo : packageInfo.receivers ){
-                        if(receiverInfo.name.equals("com.google.firebase.iid.FirebaseInstanceIdReceiver") || receiverInfo.name.equals("com.google.android.gms.measurement.AppMeasurementReceiver")){
+                        if(receiverInfo.name.equals("com.google.firebase.iid.FirebaseInstanceIdReceiver")){
                             flag = true;
                             appInfo.includeFcm = true;
                             break;
                         }
                     }
-                }else{
-                    continue;
+                }
+                if (!flag) {
+                    Intent receive = new Intent("com.google.android.c2dm.intent.RECEIVE").setPackage(packageInfo.packageName);
+                    Intent service = new Intent("com.google.firebase.MESSAGING_EVENT").setPackage(packageInfo.packageName);
+                    int flags = PackageManager.MATCH_DISABLED_COMPONENTS;
+                    flag = !packageManager.queryBroadcastReceivers(receive, flags).isEmpty()
+                            || !packageManager.queryIntentServices(service, flags).isEmpty();
+                    appInfo.includeFcm = flag;
                 }
                 if(allowListSet.contains(appInfo.packageName)){
                     appInfo.isAllow = true;
@@ -358,7 +364,14 @@ public class MainActivity extends AppCompatActivity {
             if (!saved) {
                 throw new IllegalStateException("配置写入失败");
             }
-            this.sendBroadcast(new Intent(getPackageName() + ".update.config"));
+            Intent refresh = new Intent(getPackageName() + ".update.config");
+            if (android.os.Build.VERSION.SDK_INT >= 34) {
+                sendBroadcast(refresh, null, android.app.BroadcastOptions.makeBasic()
+                        .setShareIdentityEnabled(true).toBundle());
+            } else {
+                android.widget.Toast.makeText(this, "配置已保存；Android 14 以下需重启手机生效",
+                        android.widget.Toast.LENGTH_LONG).show();
+            }
             return true;
         } catch (Throwable e) {
             Log.e("updateConfig",e.toString());

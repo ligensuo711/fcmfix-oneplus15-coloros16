@@ -8,8 +8,8 @@ android {
         applicationId "io.github.artifical0.fcmfix.coloros"
         minSdkVersion 29
         targetSdkVersion 34
-        versionCode 63
-        versionName "53-coloros-8-phk110"
+        versionCode 64
+        versionName "53-coloros-9-rc1-phk110"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -25,12 +25,10 @@ android {
         targetCompatibility JavaVersion.VERSION_17
     }
 
-    lint {
-        checkReleaseBuilds = false
-    }
 }
 
 dependencies {
+    testImplementation 'junit:junit:4.13.2'
     compileOnly 'io.github.libxposed:api:101.0.1'
     implementation 'io.github.libxposed:interface:101.0.0'
     implementation 'io.github.libxposed:service:101.0.0'

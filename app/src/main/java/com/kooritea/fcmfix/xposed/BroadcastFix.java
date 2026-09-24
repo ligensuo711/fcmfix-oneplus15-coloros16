@@ -13,7 +13,6 @@ import androidx.core.app.NotificationCompat;
 import androidx.core.app.NotificationManagerCompat;
 
 import java.lang.reflect.Method;
-import java.lang.reflect.Parameter;
 import java.util.HashSet;
 import java.util.Set;
 import com.kooritea.fcmfix.libxposed.XC_MethodHook;
@@ -21,6 +20,7 @@ import com.kooritea.fcmfix.libxposed.XposedBridge;
 import com.kooritea.fcmfix.libxposed.XposedHelpers;
 
 import com.kooritea.fcmfix.util.IceboxUtils;
+import com.kooritea.fcmfix.util.FcmTrust;
 import com.kooritea.fcmfix.util.XposedUtils;
 
 public class BroadcastFix extends XposedModule {
@@ -75,12 +75,14 @@ public class BroadcastFix extends XposedModule {
                     continue;
                 }
                 try {
-                    createBroadcastIntentHooker(intentArgsIndex, -1, method, "entry");
+                    createBroadcastIntentHooker(intentArgsIndex, method, "entry");
                     hookCount++;
                 } catch (Throwable e) {
                     printLog("hook broadcast entry failed: " + signature + ": " + e.getMessage());
                 }
             }
+            // AMS delegates to BroadcastController; do not install a second entry there.
+            if (hookCount > 0) break;
         }
         printLog("ColorOS 16 broadcast entry hooks active: " + hookCount);
     }
@@ -115,9 +117,8 @@ public class BroadcastFix extends XposedModule {
                     continue;
                 }
 
-                int appOpArgsIndex = findAppOpParameterIndex(method);
                 try {
-                    createBroadcastIntentHooker(intentArgsIndex, appOpArgsIndex, method, "locked");
+                    createBroadcastIntentHooker(intentArgsIndex, method, "locked");
                     hookCount++;
                 } catch (Throwable e) {
                     printLog("hook broadcast candidate failed: " + signature + ": " + e.getMessage());
@@ -142,39 +143,6 @@ public class BroadcastFix extends XposedModule {
         return -1;
     }
 
-    private int findAppOpParameterIndex(Method method) {
-        Parameter[] parameters = method.getParameters();
-        for (int i = 0; i < parameters.length; i++) {
-            if (parameters[i].getType() == int.class && "appOp".equals(parameters[i].getName())) {
-                return i;
-            }
-        }
-
-        // Release framework builds often strip parameter names. Keep known AOSP
-        // locations only as an optional enhancement; adding the stopped-package
-        // flag does not depend on finding appOp.
-        int[] candidates;
-        if (Build.VERSION.SDK_INT >= 35) {
-            candidates = new int[]{13, 12};
-        } else if (Build.VERSION.SDK_INT == 34) {
-            candidates = new int[]{13, 12};
-        } else if (Build.VERSION.SDK_INT == 33) {
-            candidates = new int[]{12};
-        } else if (Build.VERSION.SDK_INT >= 31) {
-            candidates = new int[]{12, 11};
-        } else if (Build.VERSION.SDK_INT == Build.VERSION_CODES.R) {
-            candidates = new int[]{10};
-        } else {
-            candidates = new int[]{9};
-        }
-        for (int candidate : candidates) {
-            if (candidate < parameters.length && parameters[candidate].getType() == int.class) {
-                return candidate;
-            }
-        }
-        return -1;
-    }
-
     private String describeMethod(Method method) {
         StringBuilder result = new StringBuilder(method.getDeclaringClass().getName())
                 .append('#').append(method.getName()).append('(');
@@ -186,88 +154,46 @@ public class BroadcastFix extends XposedModule {
         return result.append(')').toString();
     }
 
-    protected void createBroadcastIntentLockedHooker(int intent_args_index, int appOp_args_index, Method method){
-        createBroadcastIntentHooker(intent_args_index, appOp_args_index, method, "locked");
-    }
-
-    protected void createBroadcastIntentHooker(int intent_args_index, int appOp_args_index, Method method, String stage){
-        printLog("Android API: " + Build.VERSION.SDK_INT);
-        printLog("appOp_args_index: " + appOp_args_index);
-        printLog("intent_args_index: " + intent_args_index);
+    protected void createBroadcastIntentHooker(int intentIndex, Method method, String stage) {
         printLog("hook target [" + stage + "]: " + describeMethod(method));
-        final int finalIntent_args_index = intent_args_index;
-        final int finalAppOp_args_index = appOp_args_index;
-        final String finalStage = stage;
-
-        XposedBridge.hookMethod(method,new XC_MethodHook() {
+        final boolean entry = "entry".equals(stage);
+        XposedBridge.hookMethod(method, new XC_MethodHook() {
             @Override
-            protected void beforeHookedMethod(MethodHookParam methodHookParam) {
-                if(!isBootComplete){
-                    return;
-                }
-                if(methodHookParam.args[finalIntent_args_index] == null){
-                    return;
-                }
-                Intent intent = (Intent) methodHookParam.args[finalIntent_args_index];
-                // 介入条件：Intent是FCM且目标在允许列表。注意不能以
-                // FLAG_INCLUDE_STOPPED_PACKAGES 是否缺失作为介入条件：
-                // 部分 ROM 上 GMS 原生携带该 flag（GCM 日志 xflg=0x4），
-                // 此时跳过会导致投递窗口（防二次冻结/断网）完全不生效。
-                if(isFCMIntent(intent)){
-                    String target;
-                    if (intent.getComponent() != null) {
-                        target = intent.getComponent().getPackageName();
-                    } else {
-                        target = intent.getPackage();
+            protected void beforeHookedMethod(MethodHookParam param) {
+                // Mask before even resolving config/UID: a failing nested validation must
+                // not expose the outer trusted scope while the original call continues.
+                if (entry) param.addFinallyAction(FcmTrust.enter(null, -1));
+                try {
+                    Intent intent = param.args[intentIndex] instanceof Intent ? (Intent) param.args[intentIndex] : null;
+                    String target = explicitTarget(intent);
+                    boolean allowed = isBootComplete && targetIsAllow(target);
+                    int callerUid = android.os.Binder.getCallingUid();
+                    boolean trusted = entry && intent != null && allowed
+                            && FcmTrust.allowsEntry(intent.getAction(), target, true, isGmsUid(callerUid));
+                    if (entry) {
+                        // Mask even null/invalid nested entries; the bridge restores this in finally.
+                        if (trusted) param.addFinallyAction(FcmTrust.enter(target, callerUid));
+                        if (!trusted && allowed && intent != null && FcmTrust.RECEIVE.equals(intent.getAction())) {
+                            logOnce("FCM rejected: untrusted sender uid=" + callerUid + ", target=" + target);
+                        }
                     }
-                    boolean targetAllowed = targetIsAllow(target);
-                    if ("entry".equals(finalStage)) {
-                        printLog("ColorOS16 FCM entry: target=" + target
-                                + ", flags=0x" + Integer.toHexString(intent.getFlags())
-                                + ", allowed=" + targetAllowed, true);
-                    }
-                    if(targetAllowed){
+                    if (!allowed || intent == null || !FcmTrust.matches(intent.getAction(), target)) return;
+                    if (entry) {
+                        printLog("FCM trusted sender: uid=" + callerUid + ", target=" + target, true);
                         OplusProxyFix.beginFcmDeliveryWindow(target);
-                        if (finalAppOp_args_index >= 0 && finalAppOp_args_index < methodHookParam.args.length) {
-                            int i = (Integer) methodHookParam.args[finalAppOp_args_index];
-                            if (i == -1) {
-                                methodHookParam.args[finalAppOp_args_index] = 11;
-                            }
+                        if (getBooleanConfig("includeIceBoxDisableApp", false)
+                                && !IceboxUtils.isAppEnabled(context, target)) {
+                            // Bounded, best-effort activation. Never retain or replay a Binder call.
+                            IceboxUtils.requestActivation(context, target);
                         }
-                        intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
-                        if (getBooleanConfig("includeIceBoxDisableApp",false) && !IceboxUtils.isAppEnabled(context, target)) {
-                            printLog("Waiting for IceBox to activate the app: " + target, true);
-                            methodHookParam.setResult(false);
-                            new Thread(() -> {
-                                IceboxUtils.activeApp(context, target);
-                                for (int i1 = 0; i1 < 300; i1++) {
-                                    if (!IceboxUtils.isAppEnabled(context, target)) {
-                                        try {
-                                            Thread.sleep(100);
-                                        } catch (Throwable e) {
-                                            printLog("Send Forced Start Broadcast Error: " + target + " " + e.getMessage(), true);
-                                        }
-                                    } else {
-                                        break;
-                                    }
-                                }
-                                try {
-                                    if(IceboxUtils.isAppEnabled(context, target)){
-                                        printLog("Send Forced Start Broadcast [" + finalStage + "]: " + target, true);
-                                    }else{
-                                        printLog("Waiting for IceBox to activate the app timed out: " + target, true);
-                                    }
-                                    XposedBridge.invokeOriginalMethod(methodHookParam.method, methodHookParam.thisObject, methodHookParam.args);
-                                } catch (Throwable e) {
-                                    printLog("Send Forced Start Broadcast Error: " + target + " " + e.getMessage(), true);
-                                }
-                            }).start();
-                        }else{
-                            printLog("Send Forced Start Broadcast [" + finalStage + "]: " + target, true);
-                        }
-                        // cos15 unfreeze
                         OplusProxyFix.unfreeze(target);
                     }
+                    intent.addFlags(Intent.FLAG_INCLUDE_STOPPED_PACKAGES);
+                    // Framework AppOps arguments are deliberately left untouched.
+                } catch (Throwable error) {
+                    // Keep the failure mask until the original invocation has finished.
+                    param.addFinallyAction(FcmTrust.enter(null, -1));
+                    logOnce("FCM broadcast hook failed: " + method + ": " + error);
                 }
             }
         });
