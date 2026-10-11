@@ -7,7 +7,7 @@ public final class NotificationSignature {
 
     public static int reasonIndex(String returnType, String[] types) {
         if (!"void".equals(returnType)) return -1;
-        // PLK110 services.jar / Android 15-16.
+        // PLK110 services.jar / Android 15-17 (ColorOS 16 and 17.0.0.102).
         if (Arrays.equals(types, new String[]{"int", "int", "java.lang.String", "java.lang.String",
                 "int", "int", "int", "int"})) return 7;
         // AOSP Android 13 (also used by older supported framework branches).

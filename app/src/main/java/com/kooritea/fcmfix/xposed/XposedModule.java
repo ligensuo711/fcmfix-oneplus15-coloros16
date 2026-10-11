@@ -3,7 +3,6 @@ package com.kooritea.fcmfix.xposed;
 import android.annotation.SuppressLint;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
-import android.app.PendingIntent;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
@@ -19,27 +18,24 @@ import android.util.Log;
 import com.kooritea.fcmfix.util.FcmTrust;
 import com.kooritea.fcmfix.util.ConfigSnapshot;
 import com.kooritea.fcmfix.util.DiagnosticLogger;
+import com.kooritea.fcmfix.util.HookStatus;
 import com.kooritea.fcmfix.util.OplusAttribution;
+import com.kooritea.fcmfix.util.SelfCheck;
 import java.lang.reflect.Method;
-
-import androidx.core.app.NotificationCompat;
-import androidx.core.app.NotificationManagerCompat;
 
 import com.kooritea.fcmfix.libxposed.XC_MethodHook;
 import com.kooritea.fcmfix.libxposed.XposedBridge;
 import com.kooritea.fcmfix.libxposed.XposedHelpers;
 
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.Set;
 
 import static android.content.Context.NOTIFICATION_SERVICE;
 
 public abstract class XposedModule {
     protected static final String MODULE_PACKAGE_NAME = "io.github.artifical0.fcmfix.coloros";
-    protected static final String ACTION_LOG = MODULE_PACKAGE_NAME + ".log";
     protected static final String ACTION_UPDATE_CONFIG = MODULE_PACKAGE_NAME + ".update.config";
+    private static final String ACTION_QUERY_STATUS = MODULE_PACKAGE_NAME + HookStatus.QUERY_ACTION_SUFFIX;
     private static String selfPackageName = "UNKNOWN";
 
     protected final ClassLoader classLoader;
@@ -56,7 +52,7 @@ public abstract class XposedModule {
     private static final Set<String> loggedWarnings = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final DiagnosticLogger diagnosticLogger = new DiagnosticLogger(
             text -> XposedBridge.log("[fcmfix] " + text),
-            error -> Log.w(TAG, "Diagnostic logging/relay failed; further relay warnings suppressed", error));
+            error -> Log.w(TAG, "Diagnostic logging failed; further warnings suppressed", error));
 
     protected static void logOnce(String message) {
         // Bounded deduplication so third-party spam cannot grow system_server memory indefinitely.
@@ -101,19 +97,10 @@ public abstract class XposedModule {
 
     private static void callAllOnCanReadConfig() {
         initReceiver();
-        if ("android".equals(getSelfPackageName())) {
-            new Thread(() -> {
-                try {
-                    Thread.sleep(60000);
-                    isBootComplete = true;
-                    printLog("Boot Complete");
-                } catch (Throwable e) {
-                    printLog(e.getMessage());
-                }
-            }).start();
-        } else {
-            isBootComplete = true;
-        }
+        // Upstream waited another 60 s here, but GMS reconnects and flushes the messages queued
+        // during a reboot within that minute; stopped apps would miss them. Until the config
+        // finishes loading, targetIsAllow() is false anyway.
+        isBootComplete = true;
         for (XposedModule instance : instances) {
             try {
                 instance.onCanReadConfig();
@@ -131,32 +118,8 @@ public abstract class XposedModule {
     }
 
     protected static void printLog(String text, boolean isDiagnosticsLog) {
-        Context logContext = context;
         diagnosticLogger.log("[" + getSelfPackageName() + "]" + text, isDiagnosticsLog,
-                SystemClock.elapsedRealtime(), logContext == null ? null
-                        : message -> sendDiagnosticLog(logContext, message));
-    }
-
-    // Lint reads the module APK manifest, but this bridge runs inside the host process.
-    // The signature permission is checked against that host at runtime below; do not
-    // request it for the module APK or suppress permission checking anywhere else.
-    @SuppressLint("MissingPermission")
-    private static void sendDiagnosticLog(Context logContext, String message) {
-        Intent log = new Intent(ACTION_LOG);
-        log.setPackage("com.google.android.gms");
-        log.putExtra("text", message);
-        // Our own worker has no incoming GMS Binder identity.
-        if (logContext.checkSelfPermission("android.permission.INTERACT_ACROSS_USERS")
-                == PackageManager.PERMISSION_GRANTED) {
-            logContext.sendBroadcastAsUser(log, Process.myUserHandle());
-        } else if (Process.myUid() != Process.SYSTEM_UID) {
-            // An ordinary app context already belongs to its own user. The qualified-user
-            // warning is specific to system UID; preserve the ordinary-app relay path.
-            logContext.sendBroadcast(log);
-        } else {
-            // The logger catches this and retains local output without a noisy fallback.
-            throw new SecurityException("Host cannot send a user-qualified diagnostic broadcast");
-        }
+                SystemClock.elapsedRealtime());
     }
 
     protected void checkUserDeviceUnlockAndUpdateConfig() {
@@ -188,7 +151,16 @@ public abstract class XposedModule {
             checkUserDeviceUnlockAndUpdateConfig();
             return false;
         }
-        return packageName != null && snapshot.allowList.contains(packageName);
+        return snapshot.allows(packageName, FcmPackages.current());
+    }
+
+    protected String findAllowedPackageArgument(Object[] args) {
+        for (Object arg : args) {
+            if (arg instanceof String && targetIsAllow((String) arg)) {
+                return (String) arg;
+            }
+        }
+        return null;
     }
 
     protected boolean getBooleanConfig(String key, boolean defaultValue) {
@@ -215,7 +187,11 @@ public abstract class XposedModule {
                 try {
                     SharedPreferences preferences = XposedBridge.getRemotePreferences("config");
                     if (preferences == null) throw new IllegalStateException("RemotePreferences unavailable");
-                    config = new ConfigSnapshot(preferences.getAll());
+                    ConfigSnapshot loaded = new ConfigSnapshot(preferences.getAll());
+                    config = loaded;
+                    if (loaded.autoAllowFcm() && "android".equals(getSelfPackageName())) {
+                        FcmPackages.ensureScanned(context);
+                    }
                 } catch (Throwable e) {
                     printLog("Remote config reload failed: " + e.getMessage());
                 }
@@ -224,6 +200,7 @@ public abstract class XposedModule {
         loadConfigThread.start();
     }
 
+    /** Removes the channel that older versions' no-response notification created in system_server. */
     private static void onUninstallFcmfix() {
         NotificationManager notificationManager = (NotificationManager) context.getSystemService(NOTIFICATION_SERVICE);
         NotificationChannel channel = notificationManager.getNotificationChannel("fcmfix");
@@ -239,17 +216,42 @@ public abstract class XposedModule {
 
             IntentFilter updateConfigIntentFilter = new IntentFilter();
             updateConfigIntentFilter.addAction(ACTION_UPDATE_CONFIG);
+            updateConfigIntentFilter.addAction(ACTION_QUERY_STATUS);
             if (Build.VERSION.SDK_INT >= 34) {
                 context.registerReceiver(new BroadcastReceiver() {
                     public void onReceive(Context context, Intent intent) {
                         String action = intent.getAction();
                         if (ACTION_UPDATE_CONFIG.equals(action) && isConfigSender(this)) {
                             onUpdateConfig();
+                        } else if (ACTION_QUERY_STATUS.equals(action) && isOrderedBroadcast() && isConfigSender(this)) {
+                            if (intent.getBooleanExtra(SelfCheck.EXTRA_CHECK, false)
+                                    && "android".equals(getSelfPackageName())) {
+                                answerSelfCheck(goAsync());
+                            } else {
+                                setResultExtras(addHookStatus(getResultExtras(true),
+                                        intent.getBooleanExtra(HookStatus.EXTRA_LOGS, false)));
+                            }
                         }
                     }
                 }, updateConfigIntentFilter, Context.RECEIVER_EXPORTED);
             } else {
                 logOnce("Authenticated config refresh requires Android 14+; reboot to reload on older Android.");
+            }
+
+            if ("android".equals(getSelfPackageName())) {
+                FcmConnectionMonitor.start(context);
+                IntentFilter packageFilter = new IntentFilter();
+                packageFilter.addAction(Intent.ACTION_PACKAGE_ADDED);
+                packageFilter.addAction(Intent.ACTION_PACKAGE_CHANGED);
+                packageFilter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+                packageFilter.addDataScheme("package");
+                context.registerReceiver(new BroadcastReceiver() {
+                    public void onReceive(Context context, Intent intent) {
+                        if (intent.getData() != null) {
+                            FcmPackages.onPackageChanged(context, intent.getData().getSchemeSpecificPart());
+                        }
+                    }
+                }, packageFilter);
             }
 
             IntentFilter unInstallIntentFilter = new IntentFilter();
@@ -274,41 +276,36 @@ public abstract class XposedModule {
 
     }
 
-    protected void sendNotification(String title) {
-        sendNotification(title, null, null);
-    }
-
-    protected void sendNotification(String title, String content) {
-        sendNotification(title, content, null);
-    }
-
-    @SuppressLint("MissingPermission")
-    protected void sendNotification(String title, String content, PendingIntent pendingIntent) {
-        printLog(title, false);
-        title = "[fcmfix]" + title;
-        NotificationManagerCompat notificationManager = NotificationManagerCompat.from(context);
-        this.createFcmfixChannel(notificationManager);
-        NotificationCompat.Builder notification = new NotificationCompat.Builder(context, "fcmfix")
-                .setSmallIcon(android.R.drawable.ic_dialog_info)
-                .setContentTitle(title)
-                .setContentText(content)
-                .setPriority(NotificationCompat.PRIORITY_DEFAULT);
-        if (pendingIntent != null) {
-            notification.setContentIntent(pendingIntent).setAutoCancel(true);
-        }
-        notificationManager.notify((int) System.currentTimeMillis(), notification.build());
-    }
-
-    protected void createFcmfixChannel(NotificationManagerCompat notificationManager) {
-        if (notificationManager.getNotificationChannel("fcmfix") == null) {
-            NotificationChannel channel = new NotificationChannel("fcmfix", "fcmfix", NotificationManager.IMPORTANCE_HIGH);
-            channel.setDescription("[xposed] fcmfix");
-            notificationManager.createNotificationChannel(channel);
-        }
-    }
-
     protected boolean isFCMAction(String action) {
         return com.kooritea.fcmfix.util.FcmTrust.isAction(action);
+    }
+
+    private static Bundle addHookStatus(Bundle result, boolean logs) {
+        String process = getSelfPackageName();
+        if (logs) result.putByteArray(process + HookStatus.LOGS_SUFFIX, HookStatus.pack(XposedBridge.recentLogs()));
+        result.putStringArrayList(process + HookStatus.ACTIVE_SUFFIX, OplusHooks.STATUS.active());
+        result.putStringArrayList(process + HookStatus.FAILED_SUFFIX, OplusHooks.STATUS.failed());
+        if ("android".equals(process)) {
+            result.putBoolean(HookStatus.KEY_IGNORE_GMS_USER_SET, OplusBatteryNetworkFix.batteryIgnoresGmsUserSet());
+        }
+        return result;
+    }
+
+    /** Self-check reads other services over Binder; keep it off system_server's main thread. */
+    private static void answerSelfCheck(BroadcastReceiver.PendingResult pending) {
+        new Thread(() -> {
+            try {
+                Bundle extras = addHookStatus(pending.getResultExtras(true), false);
+                try {
+                    SelfCheckCollector.collect(context, config, extras);
+                } catch (Throwable e) {
+                    printLog("Self-check failed: " + e);
+                }
+                pending.setResultExtras(extras);
+            } finally {
+                pending.finish();
+            }
+        }, "FCMFix-selfcheck").start();
     }
 
     private static boolean isConfigSender(BroadcastReceiver receiver) {

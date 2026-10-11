@@ -6,13 +6,20 @@ import java.lang.reflect.Constructor;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Member;
 import java.lang.reflect.Method;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 
+
+import com.kooritea.fcmfix.util.LogRing;
 
 import io.github.libxposed.api.XposedInterface;
 
 public final class XposedBridge {
 
     private static XposedInterface xposedInterface;
+    private static final LogRing RECENT = new LogRing(1000);
+    private static final DateTimeFormatter TIME = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss.SSS");
 
 
     private XposedBridge() {
@@ -24,6 +31,12 @@ public final class XposedBridge {
 
     public static void log(String text) {
         android.util.Log.i("fcmfix", text);
+        RECENT.add(LocalDateTime.now().format(TIME) + " " + text);
+    }
+
+    /** This process's recent module log lines, oldest first. */
+    public static ArrayList<String> recentLogs() {
+        return RECENT.snapshot();
     }
 
     public static SharedPreferences getRemotePreferences(String group) {
@@ -50,6 +63,21 @@ public final class XposedBridge {
                 });
 
         return callback.new Unhook(new HookHandleWrapper(handle));
+    }
+
+    /**
+     * Force a caller back to non-inlined execution so hooks on its short callees fire.
+     * Returns false instead of throwing; a failed deoptimization only loses that layer.
+     */
+    public static boolean deoptimize(Member member) {
+        ensureInit();
+        if (!(member instanceof java.lang.reflect.Executable)) return false;
+        try {
+            return xposedInterface.deoptimize((java.lang.reflect.Executable) member);
+        } catch (Throwable e) {
+            log("deoptimize failed: " + member + ": " + e);
+            return false;
+        }
     }
 
     public static Object invokeOriginalMethod(Member method, Object thisObject, Object[] args) throws Throwable {
