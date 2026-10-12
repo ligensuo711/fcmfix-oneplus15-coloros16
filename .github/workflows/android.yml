@@ -58,17 +58,17 @@ jobs:
         tag_name: ${{ env.VERSION_NAME }}
         token: "${{ github.token }}"
         body: |
-          PHK110 (一加 Ace 2 / ColorOS 16 V16.0.0) 适配构建，基于上游 fcmfix-coloros 13.0-rc7 (versionCode 78)。
+          PHK110 (一加 Ace 2 / ColorOS 16 V16.0.0) 适配构建，基于上游 fcmfix-coloros 13.1-rc1 (versionCode 80)。
 
-          变更（在 upstream 13.0-rc7 之上）：
+          变更（在 upstream 13.1-rc1 之上）：
           - 保留 PHK110 固件 stopped 应用 FCM 拉起链路 hook（上游基于 ColorOS 17 评估未合并，本机 ColorOS 16 实测需要）：
             - OplusAppStartupManager.shouldPreventStartProcess（FCM 投递窗口内放行）
             - BroadcastQueueModernImplExtImpl.skipScheduleReceiver*Locked（允许列表 FCM 强制不跳过）
             - OplusSceneManager.checkReceiverIfRestricted（允许列表 FCM 放行）
             - OplusHansManager.isAllowStartService（允许列表放行）
           - FCM 投递窗口 60 秒（上游 20 秒）
-          - versionCode 79
+          - versionCode 81
 
-          签名与此前 PHK110 构建（vc61-vc64）同一把 ci-debug.keystore，可直接覆盖安装，allowList 保留。安装后需重启。
+          签名与此前 PHK110 构建（vc61-vc79）同一把 ci-debug.keystore，可直接覆盖安装，allowList 保留。安装后需重启。
         files: |
           app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk
