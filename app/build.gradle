@@ -1,4 +1,6 @@
 apply plugin: 'com.android.application'
+apply plugin: 'org.jetbrains.kotlin.android'
+apply plugin: 'org.jetbrains.kotlin.plugin.compose'
 
 android {
     namespace = "com.kooritea.fcmfix"
@@ -7,18 +9,24 @@ android {
     defaultConfig {
         applicationId "io.github.artifical0.fcmfix.coloros"
         minSdkVersion 29
-        targetSdkVersion 34
-        versionCode 82
-        versionName "13.1-rc3-phk110"
+targetSdkVersion 36
+        versionCode 83
+        versionName "13.2-phk110"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
         release {
-            minifyEnabled false
+            // LSPosed loads the whole dex into system_server and Battery. R8 drops the unused
+            // parts of the libraries; proguard-rules.pro keeps the hook side exactly as written.
+            minifyEnabled true
+            shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
+    }
+    buildFeatures {
+        compose true
     }
     sourceSets {
         // collect-report.sh is bundled for the in-app "export full report".
@@ -28,15 +36,48 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+    testOptions {
+        unitTests {
+            // Robolectric UI tests render the real drawables.
+            includeAndroidResources = true
+        }
+    }
+}
 
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+    }
+}
+
+// Screenshot tests need Robolectric's native graphics, which has no linux-arm64 build, so they
+// only run with -Pscreenshots (CI) and write PNGs to app/build/outputs/roborazzi. The UI smoke
+// tests use the legacy graphics mode and run everywhere.
+tasks.withType(Test).configureEach {
+    if (project.hasProperty("screenshots")) {
+        systemProperty "roborazzi.test.record", "true"
+    } else {
+        exclude "**/screenshots/**"
+    }
 }
 
 dependencies {
-    testImplementation 'junit:junit:4.13.2'
+    def composeBom = platform('androidx.compose:compose-bom:2026.06.01')
     compileOnly 'io.github.libxposed:api:101.0.1'
     implementation 'io.github.libxposed:interface:101.0.0'
     implementation 'io.github.libxposed:service:101.0.0'
-    implementation fileTree(dir: "libs", include: ["*.jar"])
-    implementation 'androidx.appcompat:appcompat:1.8.0'
-    implementation 'androidx.recyclerview:recyclerview:1.4.0'
+    implementation composeBom
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.activity:activity-compose:1.13.0'
+    implementation 'androidx.lifecycle:lifecycle-viewmodel-compose:2.10.0'
+    implementation 'androidx.lifecycle:lifecycle-runtime-compose:2.10.0'
+
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation composeBom
+    testImplementation 'androidx.compose.ui:ui-test-junit4'
+    testImplementation 'org.robolectric:robolectric:4.17'
+    testImplementation 'io.github.takahirom.roborazzi:roborazzi:1.77.0'
+    testImplementation 'io.github.takahirom.roborazzi:roborazzi-compose:1.77.0'
+    debugImplementation composeBom
+    debugImplementation 'androidx.compose.ui:ui-test-manifest'
 }

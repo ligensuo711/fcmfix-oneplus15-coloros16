@@ -2,7 +2,19 @@ name: Android CI
 
 on:
   push:
-    branches: [ "master" ]
+    branches: [master]
+    # 只改文档时不跑（release notes 与代码一起提交时照常构建）。
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - "NOTICE"
+      - ".github/ISSUE_TEMPLATE/**"
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.sha }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -10,65 +22,56 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-    - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
-      with:
-        java-version: '21'
-        distribution: temurin
-        cache: gradle
-    # Tagging fails late if the release notes are missing; catch it on every push instead.
-    - name: Check release notes
-      shell: bash
-      run: |
-        VERSION_NAME=$(sed -n 's/.*versionName "\([^"]*\)".*/\1/p' app/build.gradle)
-        test -f "docs/releases/$VERSION_NAME.md" || { echo "::error::missing docs/releases/$VERSION_NAME.md"; exit 1; }
-    - run: chmod +x gradlew
-    - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleRelease
-    - name: Upload verification reports
-      if: always()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-      with:
-        name: verification-reports
-        path: |
-          app/build/reports/
-          app/build/test-results/
-        retention-days: 14
-    - name: Retrieve version name
-      run: echo VERSION_NAME=$(grep "versionName" app/build.gradle | sed -E 's/.*versionName "([^"]+)".*/\1/') >> $GITHUB_ENV
-    - name: Sign APK (debug keystore)
-      run: |
-        BUILD_TOOLS_VERSION=$(ls /usr/local/lib/android/sdk/build-tools/ | tail -n 1)
-        BT=/usr/local/lib/android/sdk/build-tools/$BUILD_TOOLS_VERSION
-        KEYSTORE=$GITHUB_WORKSPACE/ci-debug.keystore
-        ZIPALIGNED=$HOME/app-release-unsigned-aligned.apk
-        $BT/zipalign -f 4 app/build/outputs/apk/release/app-release-unsigned.apk "$ZIPALIGNED"
-        $BT/apksigner sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
-          --out app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk "$ZIPALIGNED"
-        $BT/apksigner verify --print-certs app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk || true
-    - name: Upload built apk
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-      with:
-        name: release
-        path: app/build/outputs/apk/release/*.apk
-    - name: Release
-      uses: softprops/action-gh-release@v2
-      with:
-        name: "FCMFix ColorOS PHK110 (${{ env.VERSION_NAME }})"
-        tag_name: ${{ env.VERSION_NAME }}
-        token: "${{ github.token }}"
-        body: |
-          PHK110 (一加 Ace 2 / ColorOS 16 V16.0.0) 适配构建，基于上游 fcmfix-coloros 13.1-rc1 (versionCode 80)。
-
-          变更（在 upstream 13.1-rc1 之上）：
-          - 保留 PHK110 固件 stopped 应用 FCM 拉起链路 hook（上游基于 ColorOS 17 评估未合并，本机 ColorOS 16 实测需要）：
-            - OplusAppStartupManager.shouldPreventStartProcess（FCM 投递窗口内放行）
-            - BroadcastQueueModernImplExtImpl.skipScheduleReceiver*Locked（允许列表 FCM 强制不跳过）
-            - OplusSceneManager.checkReceiverIfRestricted（允许列表 FCM 放行）
-            - OplusHansManager.isAllowStartService（允许列表放行）
-          - FCM 投递窗口 60 秒（上游 20 秒）
-          - versionCode 81
-
-          签名与此前 PHK110 构建（vc61-vc79）同一把 ci-debug.keystore，可直接覆盖安装，allowList 保留。安装后需重启。
-        files: |
-          app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          java-version: '21'
+          distribution: temurin
+          cache: gradle
+      # Tagging fails late if the release notes are missing; catch it on every push instead.
+      - name: Check release notes
+        shell: bash
+        run: |
+          VERSION_NAME=$(sed -n 's/.*versionName "\([^"]*\)".*/\1/p' app/build.gradle)
+          test -f "docs/releases/$VERSION_NAME.md" || { echo "::error::missing docs/releases/$VERSION_NAME.md"; exit 1; }
+      - run: chmod +x gradlew
+      - run: ./gradlew :app:testDebugUnitTest :app:lintDebug :app:lintRelease :app:assembleRelease
+      - name: Upload verification reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verification-reports
+          path: |
+            app/build/reports/
+            app/build/test-results/
+          retention-days: 14
+      - name: Retrieve version name
+        run: echo VERSION_NAME=$(grep "versionName" app/build.gradle | sed -E 's/.*versionName "([^"]+)".*/\1/') >> $GITHUB_ENV
+      # fork 没有上游的签名 secrets，用仓库内的 ci-debug.keystore 自签（与 vc61 起同 key）。
+      - name: Sign APK (debug keystore)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          KEYSTORE=$GITHUB_WORKSPACE/ci-debug.keystore
+          ZIPALIGNED=$RUNNER_TEMP/aligned.apk
+          "$BT/zipalign" -f -p 4 app/build/outputs/apk/release/app-release-unsigned.apk "$ZIPALIGNED"
+          "$BT/apksigner" sign --ks "$KEYSTORE" --ks-pass pass:android --key-pass pass:android \
+            --out "app/build/outputs/apk/release/fcmfix-coloros-${VERSION_NAME}.apk" "$ZIPALIGNED"
+          "$BT/apksigner" verify --print-certs "app/build/outputs/apk/release/fcmfix-coloros-${VERSION_NAME}.apk"
+      - name: Upload built apk
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release
+          path: app/build/outputs/apk/release/fcmfix-coloros-*.apk
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "FCMFix ColorOS PHK110 (${{ env.VERSION_NAME }})"
+          tag_name: ${{ env.VERSION_NAME }}
+          token: "${{ github.token }}"
+          body_path: docs/releases/${{ env.VERSION_NAME }}.md
+          files: |
+            app/build/outputs/apk/release/fcmfix-coloros-${{ env.VERSION_NAME }}.apk
